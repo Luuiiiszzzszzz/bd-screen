@@ -420,6 +420,7 @@ const state = { role:null, peer:null, stream:null, viewers:new Map(), roomId:nul
 state.voice = { active:false, mic:null, muted:false, deafened:false, peers:new Map(), localAnalyser:null, meSpeaking:false };
 state.voiceRoster = new Map();
 state._prevIds = new Set(); state._rosterReady = false;
+state.screenCalls = new Map(); state.activeSharer = null;
 
 function setStatus(t,c){ $("statusText").textContent=t; $("status").className="status"+(c?" "+c:""); }
 function toast(m){ const t=$("toast"); t.textContent=m; t.classList.add("show"); clearTimeout(t._t); t._t=setTimeout(()=>t.classList.remove("show"),2600); }
@@ -460,7 +461,8 @@ function openProfile(did){ if(did) window.open("https://discord.com/users/"+did,
 
 /* ================= HOST ================= */
 function setHostControls(sharing){
-  $("shareScreenBtn").style.display = sharing?"none":"inline-flex";
+  const blocked = !!(state.activeSharer && state.activeSharer.id!==myId()) && !sharing;
+  $("shareScreenBtn").style.display = (sharing||blocked)?"none":"inline-flex";
   $("stopBtn").style.display  = sharing?"inline-flex":"none";
   $("switchBtn").style.display= sharing?"inline-flex":"none";
   $("audioBtn").style.display = sharing?"inline-flex":"none";
@@ -468,8 +470,7 @@ function setHostControls(sharing){
 function setupApp(){
   const host = state.role==="host";
   $("copyLinkBtn").style.display = host?"inline-flex":"none";
-  if(host) setHostControls(false);
-  else { $("shareScreenBtn").style.display="none"; $("stopBtn").style.display="none"; $("switchBtn").style.display="none"; $("audioBtn").style.display="none"; }
+  setHostControls(false);   // botão de compartilhar tela disponível pra todos
   $("roomCode").textContent = state.roomId || "—";
   updateUserPanel();
   renderMembers();
@@ -486,18 +487,24 @@ function createRoom(){
   setTitle();
 
   state.peer = new Peer(state.roomId, { config:{iceServers:CONFIG.iceServers} });
+  clearTimeout(state._ct); state._ct=setTimeout(()=>{ if(!state.peer||!state.peer.open){ setStatus("falha ao conectar",""); setStageNote("não consegui abrir a sala","problema ao falar com o servidor de sinalização — recarregue a página (Ctrl+Shift+R)"); } },15000);
   state.peer.on("call", onIncomingCall);
-  state.peer.on("open", ()=>{ setStatus("sala aberta","online"); clearVideoStage(); broadcastRoster(); });
+  state.peer.on("open", ()=>{ clearTimeout(state._ct); setStatus("sala aberta","online"); clearVideoStage(); broadcastRoster(); });
   state.peer.on("connection", conn=>{
     conn.on("data", data=>{
       if(!data) return;
       if(data.t==="join"){
         if(state.pass && data.pass!==state.pass){ conn.send({t:"denied",reason:"senha"}); setTimeout(()=>{try{conn.close();}catch(_){}},300); return; }
-        state.viewers.set(conn.peer, { id:conn.peer, conn, call:null, name:(data.name||"convidado"), did:data.did||null });
+        state.viewers.set(conn.peer, { id:conn.peer, conn, name:(data.name||"convidado"), did:data.did||null });
         updateViewers(); broadcastRoster();
-        if(state.stream){ conn.send({t:"accepted"}); callViewer(state.viewers.get(conn.peer)); } else conn.send({t:"waiting"});
+        conn.send({t:"share-state", id:state.activeSharer?state.activeSharer.id:null, name:state.activeSharer?state.activeSharer.name:null});
         conn.send({t:"chat-history", msgs:state.chat.slice(-50)});
       }
+      else if(data.t==="share-start"){
+        if(state.activeSharer && state.activeSharer.id!==conn.peer){ conn.send({t:"share-busy"}); return; }
+        const v=state.viewers.get(conn.peer); setActiveSharer({id:conn.peer, name:v?v.name:"convidado"}); broadcastShareState();
+      }
+      else if(data.t==="share-stop"){ if(state.activeSharer && state.activeSharer.id===conn.peer){ setActiveSharer(null); broadcastShareState(); } }
       else if(data.t==="chat"){
         const v=state.viewers.get(conn.peer), text=String(data.text||"").slice(0,500).trim(); if(!text) return;
         const msg={from:conn.peer,name:(v?v.name:"convidado"),did:(v?v.did:null),text,ts:Date.now()};
@@ -510,7 +517,7 @@ function createRoom(){
       }
       else if(data.t==="voice-leave"){ state.voiceRoster.delete(conn.peer); broadcastRoster(); }
     });
-    conn.on("close", ()=>{ state.voiceRoster.delete(conn.peer); removeViewer(conn.peer); broadcastRoster(); });
+    conn.on("close", ()=>{ state.voiceRoster.delete(conn.peer); if(state.activeSharer&&state.activeSharer.id===conn.peer){ setActiveSharer(null); broadcastShareState(); } removeViewer(conn.peer); broadcastRoster(); });
     conn.on("error", ()=>{ state.voiceRoster.delete(conn.peer); removeViewer(conn.peer); broadcastRoster(); });
   });
   state.peer.on("error", err=>{
@@ -518,13 +525,16 @@ function createRoom(){
     stageMsg("Erro de conexão ("+err.type+"). Verifique sua internet e recarregue.");
   });
 }
-function callViewer(v){
-  if(!state.stream||!state.peer||!v) return;
-  if(v.call){ try{v.call.close();}catch(_){} }
-  const call = state.peer.call(v.id, state.stream, { metadata:{kind:"screen"} });
-  v.call=call; call.on("close", ()=>{ if(v.call===call) v.call=null; });
+function screenCallTo(peerId){
+  if(!state.stream||!state.peer||peerId===myId()||peerId==="host"||peerId==="me") return;
+  const old=state.screenCalls.get(peerId); if(old){try{old.close();}catch(_){}}
+  const call=state.peer.call(peerId, state.stream, { metadata:{kind:"screen"} });
+  state.screenCalls.set(peerId, call);
+  call.on("close", ()=>{ if(state.screenCalls.get(peerId)===call){ state.screenCalls.delete(peerId); updateViewers(); } });
   setTimeout(()=>tuneBitrate(call),800);
+  updateViewers();
 }
+function shareToAll(){ for(const m of (state.roster||[])) screenCallTo(m.id); }
 function tuneBitrate(call){
   const q=QUALITY[state.quality]||QUALITY["1080"], pc=call.peerConnection; if(!pc) return;
   pc.getSenders().forEach(s=>{ if(!s.track||s.track.kind!=="video")return; const p=s.getParameters(); if(!p.encodings||!p.encodings.length)p.encodings=[{}]; p.encodings[0].maxBitrate=q.bitrate; p.encodings[0].maxFramerate=q.fps; p.degradationPreference=q.fps>=60?"maintain-framerate":"balanced"; s.setParameters(p).catch(()=>{}); });
@@ -545,34 +555,53 @@ function updateAudioBtn(){
   on.style.display=a?"":"none"; off.style.display=a?"none":""; btn.title=a?"Áudio da tela ligado":"Áudio da tela mudo"; btn.classList.toggle("muted",!a);
 }
 async function startHost(){
+  if(state.activeSharer && state.activeSharer.id!==myId()){ toast((state.activeSharer.name||"Alguém")+" já está compartilhando a tela."); return; }
   let stream; try{ stream=await acquireStream(); }
   catch(err){ if(err&&err.name==="NotAllowedError"){ return; } stageMsg("Não consegui acessar a tela. Isso costuma acontecer quando a página não está em <b>HTTPS</b>. Hospede o arquivo (GitHub Pages, Vercel) ou abra em <b>localhost</b>."); return; }
   stream.getVideoTracks()[0].addEventListener("ended", stopHost);
   state.stream=stream; $("video").srcObject=stream; $("video").muted=true;
-  hideIdle(); $("live").classList.add("on"); $("viewersBadge").classList.add("on");
-  setHostControls(true); updateAudioBtn(); setStatus("transmitindo","live"); setTitle(); stageMsg("");
-  for(const v of state.viewers.values()) callViewer(v);
+  showVideoStage(); $("live").classList.add("on"); $("viewersBadge").classList.add("on");
+  setHostControls(true); updateAudioBtn(); setStatus("transmitindo","live");
+  announceShare(true); shareToAll(); setTitle();
 }
 async function switchSource(){
   let stream; try{ stream=await acquireStream(); }
   catch(err){ if(err&&err.name==="NotAllowedError") return; toast("Não consegui trocar a fonte."); return; }
   const nv=stream.getVideoTracks()[0], na=stream.getAudioTracks()[0]||null;
   nv.addEventListener("ended", stopHost);
-  for(const v of state.viewers.values()){ const pc=v.call&&v.call.peerConnection; if(!pc)continue; pc.getSenders().forEach(s=>{ if(!s.track)return; if(s.track.kind==="video") s.replaceTrack(nv).catch(()=>{}); if(s.track.kind==="audio"&&na) s.replaceTrack(na).catch(()=>{}); }); }
+  for(const [,call] of state.screenCalls){ const pc=call.peerConnection; if(!pc)continue; pc.getSenders().forEach(s=>{ if(!s.track)return; if(s.track.kind==="video") s.replaceTrack(nv).catch(()=>{}); if(s.track.kind==="audio"&&na) s.replaceTrack(na).catch(()=>{}); }); }
   const old=state.stream; state.stream=stream; $("video").srcObject=stream; $("video").muted=true;
   if(old) old.getTracks().forEach(t=>t.stop());
   updateAudioBtn(); toast("Fonte trocada ✦");
 }
 function stopHost(){
   if(state.stream){ state.stream.getTracks().forEach(t=>t.stop()); state.stream=null; }
-  $("video").srcObject=null; $("live").classList.remove("on");
-  for(const v of state.viewers.values()){ if(v.call){try{v.call.close();}catch(_){} v.call=null;} if(v.conn&&v.conn.open) v.conn.send({t:"stopped"}); }
-  setHostControls(false); setStatus("sala aberta","online"); setTitle();
-  clearVideoStage();
+  for(const [,c] of state.screenCalls){ try{c.close();}catch(_){} } state.screenCalls.clear();
+  $("video").srcObject=null; $("live").classList.remove("on"); $("viewersBadge").classList.remove("on");
+  setHostControls(false); setStatus(state.role==="host"?"sala aberta":"na sala","online");
+  announceShare(false); clearVideoStage(); setTitle();
 }
-function removeViewer(id){ const v=state.viewers.get(id); if(v&&v.call){try{v.call.close();}catch(_){}} state.viewers.delete(id); updateViewers(); }
-function updateViewers(){ $("viewersCount").textContent=state.viewers.size; }
-function setTitle(){ $("topTitle").textContent = state.stream ? "Transmitindo a tela" : "Sala de voz"; }
+function removeViewer(id){ const c=state.screenCalls.get(id); if(c){try{c.close();}catch(_){} state.screenCalls.delete(id);} state.viewers.delete(id); updateViewers(); }
+function updateViewers(){ $("viewersCount").textContent=state.screenCalls.size; }
+function setTitle(){ const a=state.activeSharer; $("topTitle").textContent = a ? ("Transmitindo — "+(a.id===myId()?"você":(a.name||"alguém"))) : "Sala de voz"; }
+
+/* coordenação de quem compartilha a tela */
+function setActiveSharer(s){ state.activeSharer=s; }
+function announceShare(on){
+  if(state.role==="host"){ setActiveSharer(on?{id:myId(),name:state.myName}:null); broadcastShareState(); }
+  else if(state._conn&&state._conn.open){ state._conn.send({t:on?"share-start":"share-stop"}); }
+}
+function broadcastShareState(){
+  const msg={t:"share-state", id:state.activeSharer?state.activeSharer.id:null, name:state.activeSharer?state.activeSharer.name:null};
+  for(const v of state.viewers.values()){ if(v.conn&&v.conn.open) v.conn.send(msg); }
+  applyShareState();
+}
+function applyShareState(){
+  const a=state.activeSharer, meSharing=!!(a&&a.id===myId());
+  setTitle(); setHostControls(meSharing);
+  if(a && !meSharing){ if(!state.hasVideo) setStageNote((a.name||"Alguém")+" está compartilhando…","conectando ao vídeo…",true); }
+  else if(!a && !meSharing){ if(state.hasVideo){ $("video").srcObject=null; $("live").classList.remove("on"); } clearVideoStage(); }
+}
 
 /* roster de membros (host é a fonte da verdade, transmite pra todos) */
 function buildRoster(){
@@ -593,16 +622,16 @@ function viewRoom(roomId, pass){
   state.roster=[{ id:"me", name:state.myName, inVoice:false, host:false, did:myDid() }];
   showApp(); setupApp(); setTitle();
   idle("conectando…","procurando a sala",true); setStatus("conectando…");
+  clearTimeout(state._ct); state._ct=setTimeout(()=>{ if(!(state._conn&&state._conn.open)){ setStatus("falha ao conectar",""); setStageNote("não consegui entrar na sala","confira: o host está com a aba aberta? estão na mesma versão? em redes diferentes talvez precise de um TURN próprio (veja o README)"); } },15000);
   state.peer = new Peer({ config:{iceServers:CONFIG.iceServers} });
   state.peer.on("open", ()=>{
     const conn=state.peer.connect(roomId,{reliable:true}); state._conn=conn;
-    conn.on("open", ()=>{ conn.send({t:"join",name:state.myName,pass:pass||"",did:myDid()}); idle("entrando na sala…","",true); setStatus("na sala","online"); });
+    conn.on("open", ()=>{ clearTimeout(state._ct); conn.send({t:"join",name:state.myName,pass:pass||"",did:myDid()}); idle("entrando na sala…","",true); setStatus("na sala","online"); });
     conn.on("data", data=>{
       if(!data) return;
-      if(data.t==="waiting") clearVideoStage();
-      if(data.t==="accepted") idle("recebendo vídeo…","",true);
       if(data.t==="denied"){ stageMsg(data.reason==="senha"?"Senha incorreta.":"A sala recusou a conexão."); idle("acesso negado",""); }
-      if(data.t==="stopped") hideVideoWait();
+      if(data.t==="share-state"){ setActiveSharer(data.id?{id:data.id,name:data.name}:null); applyShareState(); }
+      if(data.t==="share-busy"){ toast("Alguém começou a compartilhar antes. Tente de novo."); stopHost(); }
       if(data.t==="voice-roster"){ (data.peers||[]).forEach(p=>callVoice(p.id,p.name)); }
       if(data.t==="room-roster"){ state.roster=data.members||[]; renderMembers(); }
       if(data.t==="chat-msg") addChat({from:data.from,name:data.name,did:data.did,text:data.text,ts:data.ts});
@@ -626,7 +655,7 @@ function onIncomingCall(call){
     call.answer(state.voice.mic); attachVoice(call, call.peer, (call.metadata&&call.metadata.name)||"convidado"); return;
   }
   call.answer();
-  call.on("stream", remote=>{ $("video").srcObject=remote; $("video").muted=false; hideIdle(); $("live").classList.add("on"); setStatus("ao vivo","live"); setTitle(); stageMsg(""); });
+  call.on("stream", remote=>{ $("video").srcObject=remote; $("video").muted=false; showVideoStage(); $("live").classList.add("on"); setStatus("ao vivo","live"); setTitle(); });
   call.on("close", hideVideoWait);
 }
 function callVoice(peerId, name){
@@ -721,7 +750,7 @@ function renderMembers(){
   const real=roster.filter(m=>!PLACE.has(m.id));
   if(state._rosterReady){
     const ids=new Set(real.map(m=>m.id));
-    for(const m of real){ if(!state._prevIds.has(m.id) && m.id!==myId()) soundJoin(); }
+    for(const m of real){ if(!state._prevIds.has(m.id) && m.id!==myId()){ soundJoin(); if(state.stream) screenCallTo(m.id); } }
     for(const id of state._prevIds){ if(!ids.has(id)) soundLeave(); }
     state._prevIds=ids;
   } else if(real.length){ state._prevIds=new Set(real.map(m=>m.id)); state._rosterReady=true; }
@@ -791,6 +820,7 @@ function cleanup(){
   if(state.voice&&state.voice.active){ for(const [,p] of state.voice.peers){ if(p.call){try{p.call.close();}catch(_){}} if(p.audioEl)p.audioEl.remove(); } state.voice.peers.clear(); if(state.voice.mic) state.voice.mic.getTracks().forEach(t=>t.stop()); state.voice.mic=null; state.voice.active=false; state.voice.muted=false; state.voice.deafened=false; }
   if(state.voiceRoster) state.voiceRoster.clear();
   state._prevIds=new Set(); state._rosterReady=false;
+  for(const [,c] of state.screenCalls){ try{c.close();}catch(_){} } state.screenCalls.clear(); state.activeSharer=null;
   stopSpeakingLoop();
   if(state.stream) state.stream.getTracks().forEach(t=>t.stop());
   if(state.peer){try{state.peer.destroy();}catch(_){}}
