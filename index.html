@@ -397,13 +397,11 @@
 /* ================= CONFIG ================= */
 const CONFIG = { iceServers:[
   { urls:"stun:stun.l.google.com:19302" },
-  { urls:"stun:stun1.l.google.com:19302" },
-  { urls:"stun:stun2.l.google.com:19302" },
-  // TURN público gratuito (Open Relay) — ajuda a conectar em 4G / redes fechadas.
-  // Pode ficar instável; pra produção troque pelo seu (metered.ca free ou coturn próprio).
-  { urls:"turn:openrelay.metered.ca:80", username:"openrelayproject", credential:"openrelayproject" },
-  { urls:"turn:openrelay.metered.ca:443", username:"openrelayproject", credential:"openrelayproject" },
-  { urls:"turn:openrelay.metered.ca:443?transport=tcp", username:"openrelayproject", credential:"openrelayproject" }
+  { urls:"stun:stun.relay.metered.ca:80" },
+  { urls:"turn:global.relay.metered.ca:80", username:"b7b2b9addcede1f5bb35794f", credential:"fHY1Zvnw+b77A331" },
+  { urls:"turn:global.relay.metered.ca:80?transport=tcp", username:"b7b2b9addcede1f5bb35794f", credential:"fHY1Zvnw+b77A331" },
+  { urls:"turn:global.relay.metered.ca:443", username:"b7b2b9addcede1f5bb35794f", credential:"fHY1Zvnw+b77A331" },
+  { urls:"turns:global.relay.metered.ca:443?transport=tcp", username:"b7b2b9addcede1f5bb35794f", credential:"fHY1Zvnw+b77A331" }
 ]};
 const QUALITY = { "720":{w:1280,h:720,fps:30,bitrate:2_000_000}, "1080":{w:1920,h:1080,fps:30,bitrate:4_000_000}, "1080-60":{w:1920,h:1080,fps:60,bitrate:6_500_000} };
 const NOTES = { monitor:"Você escolhe qual monitor na próxima janela, do navegador.", window:"Você escolhe qual programa na próxima janela, do navegador.", browser:"Você escolhe qual aba na próxima janela, do navegador." };
@@ -414,6 +412,21 @@ const NOTES = { monitor:"Você escolhe qual monitor na próxima janela, do naveg
    2) OAuth2 > Redirects: adicione a URL do site hospedado
    3) (opcional) cole o ID do servidor em guildId p/ liberar só membros */
 const DISCORD = { clientId:"1548437247903137882", guildId:"" };
+
+/* TURN CONFIÁVEL (metered.ca) — pra conectar em qualquer rede.
+   Crie conta grátis em https://metered.ca (produto TURN Server / Open Relay),
+   pegue o "App Name" (subdomínio) e a "API Key" e cole abaixo.
+   O app puxa as credenciais sozinho ao abrir. Deixe vazio p/ usar só STUN. */
+const METERED = { subdomain:"", apiKey:"" };
+let turnReady=false;
+async function ensureTurn(){
+  if(turnReady || !METERED.subdomain || !METERED.apiKey) return;
+  try{
+    const r=await fetch(`https://${METERED.subdomain}.metered.live/api/v1/turn/credentials?apiKey=${METERED.apiKey}`);
+    if(r.ok){ const servers=await r.json(); if(Array.isArray(servers)&&servers.length){ CONFIG.iceServers=[{urls:"stun:stun.l.google.com:19302"}].concat(servers); } }
+  }catch(e){}
+  turnReady=true;
+}
 
 const $ = id => document.getElementById(id);
 const state = { role:null, peer:null, stream:null, viewers:new Map(), roomId:null, roomUrl:"", quality:"1080", pass:"", surface:"monitor", audioEnabled:true, user:null, myName:"", roster:[], hasVideo:false, stageNote:null, chat:[] };
@@ -476,7 +489,7 @@ function setupApp(){
   renderMembers();
 }
 
-function createRoom(){
+async function createRoom(){
   state.role="host"; state.myName = myDisplayName(true); state.roomId=newRoomId();
   state.pass = $("roomPass")?$("roomPass").value.trim():"";
   state.roomUrl = roomLink(state.roomId);
@@ -485,6 +498,7 @@ function createRoom(){
   idle("sala criada","conectando…",true);
   setStatus("conectando…");
   setTitle();
+  await ensureTurn();
 
   state.peer = new Peer(state.roomId, { config:{iceServers:CONFIG.iceServers} });
   clearTimeout(state._ct); state._ct=setTimeout(()=>{ if(!state.peer||!state.peer.open){ setStatus("falha ao conectar",""); setStageNote("não consegui abrir a sala","problema ao falar com o servidor de sinalização — recarregue a página (Ctrl+Shift+R)"); } },15000);
@@ -617,11 +631,12 @@ function broadcastRoster(){
 }
 
 /* ================= ESPECTADOR ================= */
-function viewRoom(roomId, pass){
+async function viewRoom(roomId, pass){
   state.role="viewer"; state.roomId=roomId; state.myName = myDisplayName(false);
   state.roster=[{ id:"me", name:state.myName, inVoice:false, host:false, did:myDid() }];
   showApp(); setupApp(); setTitle();
   idle("conectando…","procurando a sala",true); setStatus("conectando…");
+  await ensureTurn();
   clearTimeout(state._ct); state._ct=setTimeout(()=>{ if(!(state._conn&&state._conn.open)){ setStatus("falha ao conectar",""); setStageNote("não consegui entrar na sala","confira: o host está com a aba aberta? estão na mesma versão? em redes diferentes talvez precise de um TURN próprio (veja o README)"); } },15000);
   state.peer = new Peer({ config:{iceServers:CONFIG.iceServers} });
   state.peer.on("open", ()=>{
@@ -888,6 +903,7 @@ window.addEventListener("beforeunload", cleanup);
 /* entrada */
 (function init(){
   setStatus("pronto","online");
+  ensureTurn();
   const raw=location.hash.replace(/^#/,"");
   if(raw.includes("access_token")){ handleDiscordReturn(raw); return; }
   const room=raw.trim(); if(room) enterRoom(room,"");
